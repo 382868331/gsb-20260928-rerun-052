@@ -1,7 +1,8 @@
-# 事件驱动策略回测引擎（第一版）
+# 事件驱动策略回测引擎
 
 纯 Python 标准库实现，不接任何券商或外部行情。目标：跑通
-**事件推进、策略决策、模拟成交、资金记录** 四件事，行情/策略/账户彼此分离。
+**事件推进、策略决策、模拟成交、多币种资金记录、公司行为、状态恢复** 六件事，
+行情/策略/账户彼此分离。
 
 ## 目录结构
 
@@ -11,10 +12,11 @@ backtest/
   events.py    # 事件类型与同刻优先级
   data.py      # 人工行情源（可复现合成行情 / 手工构造行情）
   broker.py    # 挂单、撤单、部分成交、手续费模拟撮合
-  account.py   # 现金、持仓、流水；仅凭 fills 的独立复算函数
+  account.py   # 多币种现金/冻结、持仓、流水与独立复算
   strategy.py  # Strategy 基类与受限 Context（信息隔离）
   engine.py    # 优先级事件队列主循环
   report.py    # 每次运行落账 + 账目核对
+  persistence.py # 中途状态保存/恢复
   cli.py       # 命令行入口
 tests/         # 验收测试（含同刻撤单/成交相撞）
 runs/          # 每次运行生成一个独立账目目录
@@ -27,13 +29,16 @@ runs/          # 每次运行生成一个独立账目目录
 | 优先级 | 事件 | 说明 |
 | --- | --- | --- |
 | 10 | market | 行情到达，先更新可见行情 |
-| 20 | strategy | 策略 `on_bar` 决策，只可见当前及历史 bar |
+| 12 | fx | 策略请求的人工汇率兑换，在公司行为/撮合前入账 |
+| 15 | corporate_action | 拆分、现金分红、暂停/恢复在生效时刻生效 |
+| 20 | strategy | 策略 on_bar 决策，只可见当前及历史 bar |
 | 30 | cancel | 撤单请求，**先于撮合** |
-| 40 | submit | 新单入账，**当根 bar 不参与撮合** |
+| 40 | submit | 新单入账并冻结资金，**当根 bar 不参与撮合** |
 | 50 | match | 对存量订单撮合，产生 0..n 笔部分成交 |
-| 60 | fill | 成交回报，更新账户并回调 `on_fill` |
+| 60 | fill | 成交回报，本金/手续费/冻结变动逐条入账并回调 on_fill |
 
 因此「同一时刻撤单与成交相撞」的默认结果是**撤单先于成交**：被撤订单不会在该时刻成交。
+拆分、现金分红、暂停在同刻先于策略和撮合生效，策略无法提前看到尚未到达的公司行为。
 该规则可通过 `BacktestEngine(cancel_before_match=False)` 反转为先成交后撤单（撤单将失败），
 两种顺序都记入 `params.json` 并由测试固定（见 `tests/test_engine.py`）。
 
@@ -45,7 +50,11 @@ runs/          # 每次运行生成一个独立账目目录
   多个订单按挂单时间先后分配；不足部分继续挂单，后续 bar 继续成交。
 - 新单在提交当根 bar 不撮合，避免使用当根未来信息。
 - 手续费 = `max(成交金额 * commission_rate, min_commission)`，每笔成交单独收取并入账。
-- 挂单、撤单本身不改变任何现金与持仓；账户只承认 `Fill`。
+- 买单按委托币种冻结「预计本金 + 预计手续费」；外币可用现金不足直接拒单，不产生冻结账。
+- 卖单允许卖空，不预扣持仓；实际成交时才更新有符号持仓。
+- 部分成交后撤单只释放剩余委托仍占用的冻结资金，已成交部分不回滚。
+- 成交本金、手续费分别生成流水；汇兑分别生成 FX_OUT 与 FX_IN 两条流水。
+- 拆分同刻调整持仓及活跃委托数量/限价；现金分红按生效时持仓入账；暂停期间挂单不撮合，恢复后继续。
 
 ## 运行
 
@@ -66,16 +75,16 @@ python -m unittest discover -s tests -v
 | `ledger.csv` | 逐笔资金/持仓账目，含每笔成交后的现金、持仓余额 |
 | `equity_curve.csv` | 每根 bar 结算后的现金、持仓市值、总权益 |
 | `event_trace.csv` | 事件推进全轨迹（时刻、优先级、序号、明细） |
+| corporate_actions.csv | 本次生效的拆分、现金分红、暂停/恢复事件 |
 | `open_orders.csv` | **结束时仍未完全成交的订单（含剩余数量），单独保留** |
-| `reconciliation.json` | 仅凭 `初始现金 + fills` 独立复算与引擎账目的核对结论 |
+| `reconciliation.json` | 仅凭初始多币种余额与 ledger 流水独立复算的核对结论 |
 
-现金与持仓的复算完全独立于引擎内部状态：
+现金、冻结与持仓的复算完全独立于引擎内部状态，按 ledger.csv 的逐笔账目重建：
 
 ```python
-from backtest.account import recompute_from_fills
-rec = recompute_from_fills(result.fills, initial_cash=result.initial_cash)
-assert rec.cash == result.final_cash
-assert rec.positions == result.final_positions
+from backtest.report import reconcile
+assert reconcile(result)["passed"]
+assert result.final_positions
 ```
 
 ## 添加新策略
@@ -95,3 +104,13 @@ class MyStrategy(Strategy):
 ```
 
 策略无法直接触碰账户现金或订单簿，所有委托都走事件队列，因此同刻顺序对所有策略一致且可复现。
+
+## 多币种、公司行为与状态恢复
+
+构造 BacktestEngine 时可传入 initial_cash={"USD": 10000.0, "EUR": 0.0}
+和 CorporateAction 列表：SPLIT、DIVIDEND、HALT、RESUME 均按 effective_at 生效。
+策略可通过 Context.convert_currency 发起人工汇率兑换；买单资金不足会拒单，成功买单才留下 RESERVE 流水。
+
+运行 engine.run(until_timestamp=20) 后调用 engine.save_state(path)，再用
+BacktestEngine.restore(path, feed, strategy).run() 可从下一时刻继续。
+恢复后的委托号、成交号、流水号和事件序号继续递增，结果与一次连续回测逐笔对应。

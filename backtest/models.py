@@ -26,6 +26,13 @@ class OrderStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
+class CorporateActionType(str, Enum):
+    SPLIT = "SPLIT"
+    DIVIDEND = "DIVIDEND"
+    HALT = "HALT"
+    RESUME = "RESUME"
+
+
 @dataclass(frozen=True)
 class Bar:
     """一根 OHLCV K 线。策略只可读取已经到达的 bar。"""
@@ -37,6 +44,7 @@ class Bar:
     low: float
     close: float
     volume: float
+    currency: str = "USD"
 
     def to_row(self) -> dict:
         return {
@@ -47,6 +55,7 @@ class Bar:
             "low": self.low,
             "close": self.close,
             "volume": self.volume,
+            "currency": self.currency,
         }
 
 
@@ -66,6 +75,14 @@ class Order:
     filled_at: Optional[int] = None
     cancelled_at: Optional[int] = None
     reject_reason: Optional[str] = None
+    currency: str = "USD"
+    reserved_cash: float = 0.0
+    reserved_position: float = 0.0
+    reserved_fee: float = 0.0
+    estimated_price: float = 0.0
+    halted: bool = False
+    halted_at: Optional[int] = None
+    resumed_at: Optional[int] = None
 
     @property
     def remaining_quantity(self) -> float:
@@ -93,6 +110,14 @@ class Order:
             "filled_at": "" if self.filled_at is None else self.filled_at,
             "cancelled_at": "" if self.cancelled_at is None else self.cancelled_at,
             "reject_reason": "" if self.reject_reason is None else self.reject_reason,
+            "currency": self.currency,
+            "reserved_cash": self.reserved_cash,
+            "reserved_position": self.reserved_position,
+            "reserved_fee": self.reserved_fee,
+            "estimated_price": self.estimated_price,
+            "halted": self.halted,
+            "halted_at": "" if self.halted_at is None else self.halted_at,
+            "resumed_at": "" if self.resumed_at is None else self.resumed_at,
         }
 
 
@@ -109,6 +134,7 @@ class Fill:
     price: float
     commission: float
     bar_timestamp: int              # 撮合发生的 bar 时刻
+    currency: str = "USD"
 
     @property
     def gross_amount(self) -> float:
@@ -127,4 +153,27 @@ class Fill:
             "gross_amount": self.gross_amount,
             "commission": self.commission,
             "bar_timestamp": self.bar_timestamp,
+            "currency": self.currency,
+        }
+
+
+@dataclass(frozen=True)
+class CorporateAction:
+    """在 effective_at 恰好生效的公司行为或交易状态变化。"""
+
+    action_type: CorporateActionType
+    symbol: str
+    effective_at: int
+    ratio: float = 1.0
+    amount: float = 0.0
+    currency: str = "USD"
+
+    def to_row(self) -> dict:
+        return {
+            "action_type": self.action_type.value,
+            "symbol": self.symbol,
+            "effective_at": self.effective_at,
+            "ratio": self.ratio,
+            "amount": self.amount,
+            "currency": self.currency,
         }

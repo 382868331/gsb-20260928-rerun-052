@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from .models import Bar, Fill, Order, OrderSide, OrderStatus, OrderType
+from .models import Bar, CorporateAction, CorporateActionType, Fill, Order, OrderSide, OrderStatus, OrderType
 
 
 @dataclass
@@ -42,6 +42,7 @@ class Broker:
         # 当前 bar 新提交的订单：本根 bar 不撮合，下一根 bar 起生效
         self._next_bar_active: set[int] = set()
         self._next_fill_id = 1
+        self._halted: set[str] = set()
 
     # ----- 委托管理 -----
 
@@ -56,7 +57,14 @@ class Broker:
         order.status = OrderStatus.OPEN
         self._orders[order.order_id] = order
         self._next_bar_active.add(order.order_id)
+        if order.symbol in self._halted:
+            order.halted = True
         return None
+
+    def reject(self, order: Order, reason: str, timestamp: Optional[int] = None) -> None:
+        order.status = OrderStatus.REJECTED
+        order.reject_reason = reason
+        self._next_bar_active.discard(order.order_id)
 
     def cancel(self, order_id: int, timestamp: int) -> tuple[bool, Optional[str]]:
         """撤单。成功返回 (True, None)，失败返回 (False, 原因)。
@@ -98,15 +106,21 @@ class Broker:
 
     # ----- 撮合 -----
 
-    def on_bar_start(self) -> None:
+    def on_bar_start(self, bar: Bar) -> None:
         """新一根 bar 开始：上一根 bar 提交的订单从本根起参与撮合。"""
-        self._next_bar_active.clear()
+        self._next_bar_active = {
+            oid for oid in self._next_bar_active
+            if (order := self._orders.get(oid)) is not None
+            and (order.symbol != bar.symbol or order.symbol in self._halted)
+        }
 
     def match(self, bar: Bar, timestamp: int) -> List[Fill]:
         """对当前 bar 撮合所有可成交的存量订单，返回本根 bar 的成交列表。"""
         fills: List[Fill] = []
         remaining_liquidity = bar.volume * self.max_participation
         for order in self.active_orders(bar.symbol):
+            if order.halted:
+                continue
             if order.order_id in self._next_bar_active:
                 continue
             if remaining_liquidity <= 0:
@@ -151,7 +165,33 @@ class Broker:
             price=fill_price,
             commission=commission,
             bar_timestamp=bar.timestamp,
+            currency=getattr(order, "currency", getattr(bar, "currency", "USD")),
         )
+
+    def apply_corporate_action(self, action: CorporateAction) -> None:
+        if action.action_type is CorporateActionType.SPLIT:
+            if action.ratio <= 0:
+                raise ValueError("拆股比例必须为正")
+            for order in self.active_orders(action.symbol):
+                order.quantity *= action.ratio
+                order.filled_quantity *= action.ratio
+                if order.limit_price is not None:
+                    order.limit_price /= action.ratio
+        elif action.action_type is CorporateActionType.HALT:
+            self._halted.add(action.symbol)
+            for order in self.active_orders(action.symbol):
+                order.halted = True
+                order.halted_at = action.effective_at
+        elif action.action_type is CorporateActionType.RESUME:
+            self._halted.discard(action.symbol)
+            self._next_bar_active = {
+                oid for oid in self._next_bar_active
+                if (order := self._orders.get(oid)) is None or order.symbol != action.symbol
+            }
+            for order in self._orders.values():
+                if order.symbol == action.symbol and order.is_active and order.halted:
+                    order.halted = False
+                    order.resumed_at = action.effective_at
 
     def params(self) -> dict:
         return {

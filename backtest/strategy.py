@@ -25,11 +25,17 @@ class Context:
         cancel,
         get_position=None,
         history_size: Optional[int] = None,
+        convert=None,
+        account=None,
+        base_currency: str = "USD",
     ):
         self._broker = broker
         self._submit = submit
         self._cancel = cancel
         self._get_position = get_position
+        self._convert = convert
+        self._account = account
+        self.base_currency = base_currency
         self._history_size = history_size
         self._history: Dict[str, Deque[Bar]] = defaultdict(lambda: deque(maxlen=history_size))
         self.now: Optional[int] = None
@@ -63,10 +69,25 @@ class Context:
             return 0.0
         return self._get_position(symbol)
 
+    def cash_view(self, currency: Optional[str] = None) -> float:
+        if self._account is None:
+            return 0.0
+        return self._account.cash_balances.get(currency or self.base_currency, 0.0)
+
+    def cash_available(self, currency: Optional[str] = None) -> float:
+        if self._account is None:
+            return 0.0
+        return self._account.cash_available(currency or self.base_currency)
+
+    def convert_currency(self, from_currency: str, to_currency: str, amount: float, rate: Optional[float] = None):
+        if self._convert is None:
+            raise RuntimeError("未启用汇兑")
+        return self._convert(from_currency, to_currency, amount, rate)
+
     # ----- 委托请求 -----
 
     def submit_limit(
-        self, symbol: str, side: OrderSide, quantity: float, limit_price: float
+        self, symbol: str, side: OrderSide, quantity: float, limit_price: float, currency: str = "USD"
     ) -> SubmitRequest:
         order = self._submit(
             symbol=symbol,
@@ -74,16 +95,18 @@ class Context:
             order_type=OrderType.LIMIT,
             quantity=quantity,
             limit_price=limit_price,
+            currency=currency,
         )
         return order
 
-    def submit_market(self, symbol: str, side: OrderSide, quantity: float) -> SubmitRequest:
+    def submit_market(self, symbol: str, side: OrderSide, quantity: float, currency: str = "USD") -> SubmitRequest:
         return self._submit(
             symbol=symbol,
             side=side,
             order_type=OrderType.MARKET,
             quantity=quantity,
             limit_price=None,
+            currency=currency,
         )
 
     def cancel_order(self, order_id: int) -> CancelRequest:

@@ -19,7 +19,7 @@ import json
 import os
 from typing import Dict, List, Sequence
 
-from .account import recompute_from_fills
+from .account import recompute_from_fills, recompute_from_ledger
 from .engine import EngineResult
 
 
@@ -38,7 +38,8 @@ def _write_csv(path: str, rows: List[dict]) -> None:
 
 def reconcile(result: EngineResult, tolerance: float = 1e-6) -> Dict:
     """仅凭 fills + 初始现金独立复算现金与持仓，与引擎内部状态核对。"""
-    rec = recompute_from_fills(result.fills, initial_cash=result.initial_cash)
+    initial_balances = getattr(result, "initial_balances", None) or {"USD": result.initial_cash}
+    rec = recompute_from_ledger(getattr(result, "ledger", []), initial_balances)
 
     position_diffs = {}
     symbols = set(result.final_positions) | set(rec.positions)
@@ -47,39 +48,59 @@ def reconcile(result: EngineResult, tolerance: float = 1e-6) -> Dict:
         if abs(diff) > tolerance:
             position_diffs[symbol] = diff
 
-    cash_diff = result.final_cash - rec.cash
-    fee_diff = result.commission_total - rec.commission_total
+    final_balances = getattr(result, "final_cash_balances", {"USD": result.final_cash})
+    cash_diffs = {
+        ccy: final_balances.get(ccy, 0.0) - rec.cash_balances.get(ccy, 0.0)
+        for ccy in set(final_balances) | set(rec.cash_balances)
+    }
+    cash_diff = cash_diffs.get("USD", 0.0)
+    engine_fees = result.commission_total if isinstance(result.commission_total, dict) else {"USD": result.commission_total}
+    fee_diffs = {ccy: engine_fees.get(ccy, 0.0) - rec.commission_total.get(ccy, 0.0)
+                 for ccy in set(engine_fees) | set(rec.commission_total)}
+    fee_diff = fee_diffs.get("USD", 0.0)
 
     # 再用 ledger 内部余额逐行自洽检查（每条余额必须等于前一条 + 增量）
-    running_cash = result.initial_cash
+    running_currency_cash: Dict[str, float] = {}
+    running_frozen_cash: Dict[str, float] = {}
     running_positions: Dict[str, float] = {}
+    running_frozen_positions: Dict[str, float] = {}
     ledger_ok = True
     for entry in getattr(result, "ledger", []):
         row = entry if isinstance(entry, dict) else entry.__dict__
-        running_cash += row["delta_cash"]
-        running_positions[row["symbol"]] = (
-            running_positions.get(row["symbol"], 0.0) + row["delta_position"]
-        )
-        ledger_ok &= abs(running_cash - row["cash_after"]) <= tolerance
-        ledger_ok &= abs(running_positions[row["symbol"]] - row["position_after"]) <= tolerance
+        if row["currency"]:
+            running_currency_cash[row["currency"]] = (
+                running_currency_cash.get(row["currency"], initial_balances.get(row["currency"], 0.0)) + row["delta_cash"]
+            )
+            running_frozen_cash[row["currency"]] = running_frozen_cash.get(row["currency"], 0.0) + row["delta_cash_frozen"]
+            ledger_ok &= abs(running_currency_cash[row["currency"]] - row["cash_after"]) <= tolerance
+            ledger_ok &= abs(running_frozen_cash[row["currency"]] - row["cash_frozen_after"]) <= tolerance
+        if row["symbol"]:
+            running_positions[row["symbol"]] = (
+                running_positions.get(row["symbol"], 0.0) + row["delta_position"]
+            )
+            running_frozen_positions[row["symbol"]] = running_frozen_positions.get(row["symbol"], 0.0) + row["delta_position_frozen"]
+            ledger_ok &= abs(running_positions[row["symbol"]] - row["position_after"]) <= tolerance
+            ledger_ok &= abs(running_frozen_positions[row["symbol"]] - row["position_frozen_after"]) <= tolerance
     passed = (
-        abs(cash_diff) <= tolerance
-        and abs(fee_diff) <= tolerance
+        all(abs(v) <= tolerance for v in cash_diffs.values())
+        and all(abs(v) <= tolerance for v in fee_diffs.values())
         and not position_diffs
         and ledger_ok
     )
     return {
         "passed": passed,
         "tolerance": tolerance,
-        "engine_final_cash": result.final_cash,
-        "recomputed_final_cash": rec.cash,
+        "engine_final_cash": final_balances,
+        "recomputed_final_cash": rec.cash_balances,
         "cash_diff": cash_diff,
+        "cash_diffs": cash_diffs,
         "engine_final_positions": result.final_positions,
         "recomputed_final_positions": rec.positions,
         "position_diffs": position_diffs,
-        "engine_commission_total": result.commission_total,
+        "engine_commission_total": engine_fees,
         "recomputed_commission_total": rec.commission_total,
         "commission_diff": fee_diff,
+        "commission_diffs": fee_diffs,
         "n_fills": len(result.fills),
     }
 
@@ -98,6 +119,9 @@ def save_run(
 
     if market_bars:
         _write_csv(os.path.join(output_dir, "market_data.csv"), [b.to_row() for b in market_bars])
+    corporate_actions = result.params.get("corporate_actions", [])
+    if corporate_actions:
+        _write_csv(os.path.join(output_dir, "corporate_actions.csv"), corporate_actions)
 
     _write_csv(os.path.join(output_dir, "orders.csv"), [o.to_row() for o in result.orders])
     _write_csv(os.path.join(output_dir, "fills.csv"), [f.to_row() for f in result.fills])

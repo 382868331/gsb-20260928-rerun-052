@@ -24,6 +24,8 @@ from .models import Bar, Fill, Order
 
 class Priority(IntEnum):
     MARKET = 10
+    FX = 12
+    CORPORATE_ACTION = 15
     STRATEGY = 20
     CANCEL = 30
     SUBMIT = 40
@@ -58,6 +60,15 @@ class MatchBatch:
     """一次撮合的输入：当前 bar（成交结果 payload 用 Fill 列表）。"""
 
     bar: Bar
+
+
+@dataclass(frozen=True)
+class FxRequest:
+    timestamp: int
+    from_currency: str
+    to_currency: str
+    amount: float
+    rate: float
 
 
 def make_event(timestamp: int, priority: int, seq: int, kind: str, payload: Any = None) -> Event:

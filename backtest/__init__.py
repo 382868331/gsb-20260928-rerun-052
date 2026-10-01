@@ -11,7 +11,16 @@
 - report:   每次运行的完整账目落盘
 """
 
-from .models import Bar, Order, OrderSide, OrderStatus, OrderType, Fill
+from .models import (
+    Bar,
+    CorporateAction,
+    CorporateActionType,
+    Fill,
+    Order,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 
 __all__ = [
     "Bar",
@@ -20,4 +29,6 @@ __all__ = [
     "OrderStatus",
     "OrderType",
     "Fill",
+    "CorporateAction",
+    "CorporateActionType",
 ]

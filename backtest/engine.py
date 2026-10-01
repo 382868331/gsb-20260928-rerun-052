@@ -1,23 +1,11 @@
-"""回测引擎：基于优先级事件队列逐 bar 推进。
-
-每个行情时刻严格按以下顺序处理（由 backtest.events.Priority 定义）：
-
-1. MARKET   bar 到达，记录行情；
-2. STRATEGY 策略 on_bar 决策，可提交撤单请求与新委托；
-3. CANCEL   处理撤单请求（撤单先于成交；见 cancel_before_match）；
-4. SUBMIT   新委托登记入订单簿（本根 bar 不参与撮合）；
-5. MATCH    对存量订单撮合，可能产生多笔部分成交；
-6. FILL     逐笔成交回报，更新账户并回调策略 on_fill。
-
-因此同一时刻撤单与成交相撞时：撤单请求先于撮合执行，
-被撤订单不会在该时刻成交。该顺序可通过参数显式配置并记入运行参数。
-"""
+"""按确定性事件顺序推进的多币种回测引擎。"""
 
 from __future__ import annotations
 
 import heapq
+import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Mapping, Optional
 
 from .account import Account
 from .broker import Broker, CommissionModel
@@ -25,12 +13,13 @@ from .data import DataFeed, SyntheticDataFeed
 from .events import (
     CancelRequest,
     Event,
+    FxRequest,
     MatchBatch,
     Priority,
     SubmitRequest,
     make_event,
 )
-from .models import Bar, Fill, Order, OrderSide, OrderStatus, OrderType
+from .models import Bar, CorporateAction, CorporateActionType, Fill, Order, OrderSide, OrderStatus, OrderType
 from .strategy import Context, Strategy
 
 
@@ -42,19 +31,18 @@ class EventTrace:
     kind: str
     detail: str
 
-    def to_row(self) -> dict:
-        return self.__dict__.copy()
+    def to_row(self): return self.__dict__.copy()
 
 
 @dataclass
 class EquityPoint:
     bar_timestamp: int
     cash: float
+    cash_balances: Dict[str, float]
     market_value: float
     equity: float
 
-    def to_row(self) -> dict:
-        return self.__dict__.copy()
+    def to_row(self): return self.__dict__.copy()
 
 
 @dataclass
@@ -67,31 +55,34 @@ class EngineResult:
     ledger: List[object]
     event_trace: List[EventTrace]
     equity_curve: List[EquityPoint]
-    commission_total: float
+    commission_total: Dict[str, float]
     params: dict
+    initial_balances: Dict[str, float]
+    final_cash_balances: Dict[str, float]
 
 
 class BacktestEngine:
-    def __init__(
-        self,
-        data_feed: DataFeed,
-        strategy: Strategy,
-        initial_cash: float = 1_000_000.0,
-        commission: Optional[CommissionModel] = None,
-        max_participation: float = 0.1,
-        cancel_before_match: bool = True,
-        run_tag: str = "run",
-    ):
-        """cancel_before_match=True 时撤单先于同刻撮合；
-        False 时撮合先于撤单（用于验证相撞顺序的可配置性）。
-        """
+    def __init__(self, data_feed: DataFeed, strategy: Strategy,
+                 initial_cash: float | Mapping[str, float] = 1_000_000.0,
+                 commission: Optional[CommissionModel] = None,
+                 max_participation: float = 0.1,
+                 cancel_before_match: bool = True,
+                 run_tag: str = "run",
+                 base_currency: str = "USD",
+                 corporate_actions: Optional[Iterable[CorporateAction]] = None,
+                 fx_rates: Optional[Mapping[str, float]] = None):
         self.data_feed = data_feed
         self.strategy = strategy
+        self.base_currency = base_currency
         self.broker = Broker(commission=commission, max_participation=max_participation)
-        self.account = Account(initial_cash=initial_cash)
+        if isinstance(initial_cash, dict):
+            self.account = Account(dict(initial_cash), base_currency=base_currency)
+        else:
+            self.account = Account(initial_cash, base_currency=base_currency)
         self.cancel_before_match = cancel_before_match
         self.run_tag = run_tag
-
+        self.actions = sorted(corporate_actions or [], key=lambda a: (a.effective_at, a.action_type.value, a.symbol))
+        self.fx_rates = dict(fx_rates or {})
         self._queue: List[Event] = []
         self._seq = 0
         self._next_order_id = 1
@@ -99,73 +90,67 @@ class BacktestEngine:
         self._trace: List[EventTrace] = []
         self._equity_curve: List[EquityPoint] = []
         self._last_prices: Dict[str, float] = {}
+        self._last_timestamp: Optional[int] = None
         self.ctx: Optional[Context] = None
 
-    def _push(self, timestamp: int, priority: int, kind: str, payload=None) -> None:
+    def _push(self, timestamp, priority, kind, payload=None):
         self._seq += 1
-        heapq.heappush(
-            self._queue,
-            make_event(timestamp, priority, self._seq, kind, payload),
-        )
+        heapq.heappush(self._queue, make_event(timestamp, priority, self._seq, kind, payload))
 
-    def _record(self, event: Event, detail: str = "") -> None:
-        self._trace.append(
-            EventTrace(
-                seq=event.seq,
-                timestamp=event.timestamp,
-                priority=event.priority,
-                kind=event.kind,
-                detail=detail,
-            )
-        )
+    def _record(self, event, detail=""):
+        self._trace.append(EventTrace(event.seq, event.timestamp, event.priority, event.kind, detail))
 
-    # ----- 策略请求入口 -----
-
-    def _submit(
-        self,
-        symbol: str,
-        side: OrderSide,
-        order_type: OrderType,
-        quantity: float,
-        limit_price: Optional[float],
-    ) -> SubmitRequest:
-        order = Order(
-            order_id=self._next_order_id,
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            quantity=quantity,
-            submitted_at=self.ctx.now if self.ctx is not None else 0,
-            limit_price=limit_price,
-        )
+    def _submit(self, symbol, side, order_type, quantity, limit_price, currency="USD"):
+        price = limit_price
+        if price is None:
+            price = self._last_prices.get(symbol, 0.0)
+        order = Order(self._next_order_id, symbol, side, order_type, quantity,
+                      self.ctx.now, limit_price=limit_price, currency=currency,
+                      estimated_price=price or 0.0)
         self._next_order_id += 1
         req = SubmitRequest(order=order)
         self._push(self.ctx.now, Priority.SUBMIT, "submit", req)
         return req
 
-    def _cancel(self, order_id: int) -> CancelRequest:
-        req = CancelRequest(order_id=order_id, requested_at=self.ctx.now)
+    def _cancel(self, order_id):
+        req = CancelRequest(order_id, self.ctx.now)
         priority = Priority.CANCEL if self.cancel_before_match else Priority.MATCH + 5
         self._push(self.ctx.now, priority, "cancel", req)
         return req
 
-    # ----- 主循环 -----
+    def _convert(self, from_currency, to_currency, amount, rate=None):
+        if rate is None:
+            rate = self.fx_rates.get(f"{from_currency}/{to_currency}") or self.fx_rates.get(f"{to_currency}/{from_currency}")
+            if rate is None:
+                raise ValueError("缺少汇兑汇率")
+            if f"{to_currency}/{from_currency}" in self.fx_rates:
+                rate = 1.0 / self.fx_rates[f"{to_currency}/{from_currency}"]
+        req = FxRequest(self.ctx.now, from_currency, to_currency, amount, rate)
+        self._push(self.ctx.now, Priority.FX, "fx", req)
+        return req
 
-    def run(self) -> EngineResult:
-        self.ctx = Context(
-            broker=self.broker,
-            submit=self._submit,
-            cancel=self._cancel,
-            get_position=self.account.position,
-        )
-        for bar in self.data_feed.bars():
+    def run(self, until_timestamp: Optional[int] = None):
+        self.ctx = Context(self.broker, self._submit, self._cancel, self.account.position,
+                           convert=self._convert, account=self.account, base_currency=self.base_currency)
+        bars = list(self.data_feed.bars())
+        self._rebuild_history(bars)
+        start_after = self._last_timestamp
+        for bar in bars:
+            if start_after is not None and bar.timestamp <= start_after:
+                continue
             self._push(bar.timestamp, Priority.MARKET, "market", bar)
             self._push(bar.timestamp, Priority.STRATEGY, "strategy", bar)
             match_priority = Priority.MATCH if self.cancel_before_match else Priority.CANCEL - 1
-            self._push(bar.timestamp, match_priority, "match", MatchBatch(bar=bar))
-
+            self._push(bar.timestamp, match_priority, "match", MatchBatch(bar))
+        for action in self.actions:
+            if start_after is not None and action.effective_at <= start_after:
+                continue
+            self._push(action.effective_at, Priority.CORPORATE_ACTION, "corporate_action", action)
         while self._queue:
             event = heapq.heappop(self._queue)
+            if until_timestamp is not None and event.timestamp > until_timestamp:
+                heapq.heappush(self._queue, event)
+                break
             handler = {
                 "market": self._on_market,
                 "strategy": self._on_strategy,
@@ -173,103 +158,123 @@ class BacktestEngine:
                 "submit": self._on_submit,
                 "match": self._on_match,
                 "fill": self._on_fill,
+                "corporate_action": self._on_corporate_action,
+                "fx": self._on_fx,
             }[event.kind]
             handler(event)
-
-            # 该时刻最后一个事件处理完毕（下一个事件属于更晚的 bar）即结算本根 bar。
             if not self._queue or self._queue[0].timestamp != event.timestamp:
-                bar = self.ctx.current_bar
-                if bar is not None and bar.timestamp == event.timestamp:
-                    self._on_bar_settled(bar)
-
+                self._settle_timestamp(event.timestamp)
+                self._last_timestamp = event.timestamp
         return self._build_result()
 
-    def _on_market(self, event: Event) -> None:
-        bar: Bar = event.payload
-        self._last_prices[bar.symbol] = bar.close
-        # 新一根 bar 开始：上一根 bar 提交的订单自本根起参与撮合。
-        # 本根 bar 策略随后提交的新单会再次进入该集合，故不参与本根撮合。
-        self.broker.on_bar_start()
-        self._record(event, f"{bar.symbol}@{bar.timestamp} close={bar.close} volume={bar.volume}")
+    def _rebuild_history(self, bars):
+        if self._last_timestamp is None:
+            return
+        for bar in bars:
+            if bar.timestamp <= self._last_timestamp:
+                self._last_prices[bar.symbol] = bar.close
+                self.ctx._on_bar(bar)
 
-    def _on_strategy(self, event: Event) -> None:
-        bar: Bar = event.payload
-        self._record(event, f"on_bar {bar.symbol}@{bar.timestamp}")
+    def _on_market(self, event):
+        bar = event.payload
+        self._last_prices[bar.symbol] = bar.close
+        self.broker.on_bar_start(bar)
+        self._record(event, f"{bar.symbol}@{bar.timestamp} close={bar.close} currency={getattr(bar, 'currency', 'USD')}")
+
+    def _on_strategy(self, event):
+        bar = event.payload
         self.ctx._on_bar(bar)
+        self._record(event, f"on_bar {bar.symbol}@{bar.timestamp}")
         self.strategy.on_bar(self.ctx, bar)
 
-    def _on_cancel(self, event: Event) -> None:
-        req: CancelRequest = event.payload
+    def _on_cancel(self, event):
+        req = event.payload
+        order = self.broker.get_order(req.order_id)
         ok, reason = self.broker.cancel(req.order_id, event.timestamp)
+        if ok and order is not None:
+            self.account.release_order(order, event.timestamp)
         detail = f"cancel order={req.order_id} ok={ok}"
-        if reason:
-            detail += f" reason={reason}"
+        if reason: detail += f" reason={reason}"
         self._record(event, detail)
 
-    def _on_submit(self, event: Event) -> None:
-        req: SubmitRequest = event.payload
-        order = req.order
+    def _on_submit(self, event):
+        order = event.payload.order
         reason = self.broker.register(order)
-        detail = (
-            f"submit order={order.order_id} {order.side.value} "
-            f"{order.order_type.value} qty={order.quantity} price={order.limit_price} accepted"
-        )
-        if reason:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = reason
-            detail = f"submit order={order.order_id} rejected reason={reason}"
-        self._record(event, detail)
+        if reason is None:
+            gross = order.quantity * (order.limit_price if order.limit_price is not None else order.estimated_price)
+            reason = self.account.reserve_order(order, self.broker.commission.commission(gross))
+            if reason is not None:
+                self.broker.reject(order, reason)
+        else:
+            self.broker.reject(order, reason)
+        self._record(event, f"submit order={order.order_id} status={order.status.value} reason={order.reject_reason or ''}")
 
-    def _on_match(self, event: Event) -> None:
-        batch: MatchBatch = event.payload
-        bar = batch.bar
+    def _on_match(self, event):
+        bar = event.payload.bar
         fills = self.broker.match(bar, event.timestamp)
         for fill in fills:
-            self._record(
-                event,
-                f"matched order={fill.order_id} qty={fill.quantity} price={fill.price} fee={fill.commission:.4f}",
-            )
+            self._record(event, f"matched order={fill.order_id} qty={fill.quantity} price={fill.price} fee={fill.commission:.4f}")
             self._push(event.timestamp, Priority.FILL, "fill", fill)
-        self._record(event, f"bar {bar.symbol}@{bar.timestamp} matched {len(fills)} fill(s)")
+        if not fills:
+            self._record(event, f"bar {bar.symbol}@{bar.timestamp} matched 0 fill(s)")
 
-    def _on_bar_settled(self, bar: Bar) -> None:
-        """该时刻所有事件处理完毕后记录权益点。"""
-        market_value = self.account.market_value({bar.symbol: bar.close})
-        self._equity_curve.append(
-            EquityPoint(
-                bar_timestamp=bar.timestamp,
-                cash=self.account.cash,
-                market_value=market_value,
-                equity=self.account.cash + market_value,
-            )
-        )
-
-    def _on_fill(self, event: Event) -> None:
-        fill: Fill = event.payload
-        self.account.apply_fill(fill)
+    def _on_fill(self, event):
+        fill = event.payload
+        order = self.broker.get_order(fill.order_id)
+        ref_price = order.limit_price if order.limit_price is not None else fill.price
+        remaining_fee = 0.0
+        if order.remaining_quantity > 0:
+            remaining_fee = self.broker.commission.commission(order.remaining_quantity * ref_price)
+        self.account.apply_fill(fill, order=order, remaining_fee=remaining_fee)
         self._fills.append(fill)
-        self._record(event, f"fill order={fill.order_id} qty={fill.quantity} cash={self.account.cash:.2f}")
+        self._record(event, f"fill order={fill.order_id} qty={fill.quantity} currency={fill.currency}")
         self.strategy.on_fill(self.ctx, fill)
 
-    def _build_result(self) -> EngineResult:
-        orders = self.broker.all_orders()
+    def _on_corporate_action(self, event):
+        action = event.payload
+        if action.action_type is CorporateActionType.SPLIT:
+            self.broker.apply_corporate_action(action)
+            self.account.apply_split(action, self.broker.active_orders(action.symbol))
+        elif action.action_type is CorporateActionType.DIVIDEND:
+            self.account.apply_dividend(action)
+        else:
+            self.broker.apply_corporate_action(action)
+        self._record(event, f"{action.action_type.value} {action.symbol}")
+
+    def _on_fx(self, event):
+        req = event.payload
+        self.account.apply_fx(req.timestamp, req.from_currency, req.to_currency, req.amount, req.rate)
+        self._record(event, f"fx {req.amount}{req.from_currency}->{req.to_currency} rate={req.rate}")
+
+    def _settle_timestamp(self, timestamp):
+        marks = {s: p for s, p in self._last_prices.items()}
+        market_value = self.account.market_value(marks)
+        self._equity_curve.append(EquityPoint(timestamp, self.account.cash,
+                                              dict(self.account.cash_balances),
+                                              market_value,
+                                              self.account.cash + market_value))
+
+    def save_state(self, path):
+        from .persistence import save_engine_state
+        save_engine_state(self, path)
+
+    @classmethod
+    def restore(cls, path, data_feed, strategy):
+        from .persistence import restore_engine_state
+        return restore_engine_state(cls, path, data_feed, strategy)
+
+    def _build_result(self):
         params = {
             "run_tag": self.run_tag,
-            "initial_cash": self.account.initial_cash,
+            "base_currency": self.base_currency,
+            "initial_balances": self.account.initial_balances,
             "cancel_before_match": self.cancel_before_match,
             "broker": self.broker.params(),
             "data": self.data_feed.params() if isinstance(self.data_feed, SyntheticDataFeed) else {"kind": type(self.data_feed).__name__},
             "strategy": self.strategy.params(),
+            "corporate_actions": [a.to_row() for a in self.actions],
         }
-        return EngineResult(
-            initial_cash=self.account.initial_cash,
-            final_cash=self.account.cash,
-            final_positions=dict(self.account.positions),
-            fills=self._fills,
-            orders=orders,
-            ledger=list(self.account.ledger),
-            event_trace=self._trace,
-            equity_curve=self._equity_curve,
-            commission_total=self.account.commission_total,
-            params=params,
-        )
+        return EngineResult(self.account.initial_cash, self.account.cash, dict(self.account.positions),
+                            self._fills, self.broker.all_orders(), list(self.account.ledger),
+                            self._trace, self._equity_curve, dict(self.account.commission_total), params,
+                            dict(self.account.initial_balances), dict(self.account.cash_balances))
