@@ -13,6 +13,22 @@
 
 from .models import Bar, Order, OrderSide, OrderStatus, OrderType, Fill
 
+from .settlement import (
+    AssetSpec,
+    CashBalance,
+    DividendReceivable,
+    FailDecision,
+    InsufficientFunds,
+    InsufficientPosition,
+    ManualFailPlanner,
+    Obligation,
+    ObligationStatus,
+    PositionBalance,
+    SettlementCalendar,
+    SettlementCustodian,
+    replay_journal,
+)
+
 __all__ = [
     "Bar",
     "Order",
@@ -20,4 +36,17 @@ __all__ = [
     "OrderStatus",
     "OrderType",
     "Fill",
+    "AssetSpec",
+    "CashBalance",
+    "DividendReceivable",
+    "FailDecision",
+    "InsufficientFunds",
+    "InsufficientPosition",
+    "ManualFailPlanner",
+    "Obligation",
+    "ObligationStatus",
+    "PositionBalance",
+    "SettlementCalendar",
+    "SettlementCustodian",
+    "replay_journal",
 ]
