@@ -19,7 +19,6 @@ import heapq
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from .account import Account
 from .broker import Broker, CommissionModel
 from .data import DataFeed, SyntheticDataFeed
 from .events import (
@@ -31,6 +30,7 @@ from .events import (
     make_event,
 )
 from .models import Bar, Fill, Order, OrderSide, OrderStatus, OrderType
+from .settlement import SettlementAccount
 from .strategy import Context, Strategy
 
 
@@ -50,6 +50,9 @@ class EventTrace:
 class EquityPoint:
     bar_timestamp: int
     cash: float
+    available_cash: dict
+    frozen_cash: dict
+    frozen_positions: dict
     market_value: float
     equity: float
 
@@ -62,6 +65,9 @@ class EngineResult:
     initial_cash: float
     final_cash: float
     final_positions: Dict[str, float]
+    available_cash: Dict[str, float]
+    frozen_cash: Dict[str, float]
+    frozen_positions: Dict[str, float]
     fills: List[Fill]
     orders: List[Order]
     ledger: List[object]
@@ -69,6 +75,8 @@ class EngineResult:
     equity_curve: List[EquityPoint]
     commission_total: float
     params: dict
+    settlement_events: List[object]
+    settlement_obligations: List[object]
 
 
 class BacktestEngine:
@@ -81,14 +89,18 @@ class BacktestEngine:
         max_participation: float = 0.1,
         cancel_before_match: bool = True,
         run_tag: str = "run",
+        broker: Optional[Broker] = None,
+        settlement_account: Optional[SettlementAccount] = None,
+        settlement_failures: Optional[Dict[int, Dict[int, float]]] = None,
     ):
         """cancel_before_match=True 时撤单先于同刻撮合；
         False 时撮合先于撤单（用于验证相撞顺序的可配置性）。
         """
         self.data_feed = data_feed
         self.strategy = strategy
-        self.broker = Broker(commission=commission, max_participation=max_participation)
-        self.account = Account(initial_cash=initial_cash)
+        self.broker = broker or Broker(commission=commission, max_participation=max_participation)
+        self.account = settlement_account or SettlementAccount(initial_cash=initial_cash)
+        self.settlement_failures = settlement_failures or {}
         self.cancel_before_match = cancel_before_match
         self.run_tag = run_tag
 
@@ -180,6 +192,7 @@ class BacktestEngine:
             if not self._queue or self._queue[0].timestamp != event.timestamp:
                 bar = self.ctx.current_bar
                 if bar is not None and bar.timestamp == event.timestamp:
+                    self.account.process_due(bar.timestamp, self.settlement_failures.get(bar.timestamp))
                     self._on_bar_settled(bar)
 
         return self._build_result()
@@ -234,13 +247,20 @@ class BacktestEngine:
 
     def _on_bar_settled(self, bar: Bar) -> None:
         """该时刻所有事件处理完毕后记录权益点。"""
-        market_value = self.account.market_value({bar.symbol: bar.close})
+        market_value = sum(
+            quantity * self._last_prices.get(symbol, 0.0)
+            for symbol, quantity in self.account.positions.items()
+        )
+        cash = sum(self.account.available_cash.values())
         self._equity_curve.append(
             EquityPoint(
                 bar_timestamp=bar.timestamp,
-                cash=self.account.cash,
+                cash=cash,
+                available_cash=dict(self.account.available_cash),
+                frozen_cash=dict(self.account.frozen_cash),
+                frozen_positions=dict(self.account.frozen_positions),
                 market_value=market_value,
-                equity=self.account.cash + market_value,
+                equity=cash + market_value,
             )
         )
 
@@ -248,7 +268,7 @@ class BacktestEngine:
         fill: Fill = event.payload
         self.account.apply_fill(fill)
         self._fills.append(fill)
-        self._record(event, f"fill order={fill.order_id} qty={fill.quantity} cash={self.account.cash:.2f}")
+        self._record(event, f"fill order={fill.order_id} qty={fill.quantity} available={self.account.available_cash.get(fill.currency, 0.0):.2f} {fill.currency}")
         self.strategy.on_fill(self.ctx, fill)
 
     def _build_result(self) -> EngineResult:
@@ -263,13 +283,18 @@ class BacktestEngine:
         }
         return EngineResult(
             initial_cash=self.account.initial_cash,
-            final_cash=self.account.cash,
+            final_cash=sum(self.account.available_cash.values()),
             final_positions=dict(self.account.positions),
+            available_cash=dict(self.account.available_cash),
+            frozen_cash=dict(self.account.frozen_cash),
+            frozen_positions=dict(self.account.frozen_positions),
             fills=self._fills,
             orders=orders,
-            ledger=list(self.account.ledger),
+            ledger=list(self.account.events),
             event_trace=self._trace,
             equity_curve=self._equity_curve,
             commission_total=self.account.commission_total,
             params=params,
+            settlement_events=list(self.account.events),
+            settlement_obligations=list(self.account.obligations),
         )

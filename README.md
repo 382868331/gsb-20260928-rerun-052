@@ -47,6 +47,18 @@ runs/          # 每次运行生成一个独立账目目录
 - 手续费 = `max(成交金额 * commission_rate, min_commission)`，每笔成交单独收取并入账。
 - 挂单、撤单本身不改变任何现金与持仓；账户只承认 `Fill`。
 
+## 成交确认与交收分离
+
+- 成交回报只生成逐笔 `SettlementObligation`：买入立即冻结对应币种资金，卖出立即冻结证券并扣收手续费。
+- 未到交收日的买入证券不进入可用持仓，卖出回款不进入可支付现金；跨币种成交分别按 `Fill.currency` 记录义务和币种余额。
+- `SettlementCalendar(lag, holidays)` 可按资产配置，交收日按营业日跨过节假日；默认 T+2。
+- 到期允许部分成功、部分失败；失败部分解除原冻结并继续以 `failed_quantity` 挂账。
+- 人工 `retry()` 补交沿用原成交数量、价格和费用，只完成原义务，不产生新的交易盈亏。
+- 交收日前拆分：现金分配归属截至权益登记口径的已交收持仓，未完成买方义务按拆分比例收足调整后证券，未完成卖方义务按调整后数量交割。
+- 每个 bar 的成交事件全部处理后才执行当日到期交收，因此同日卖出回款只有在该卖出本身同日交收时，才可用于后一笔买入依赖。
+- `settlement_events.csv` 是成交确认、成功、失败和补交冻结/交收的完整人工过程；`settlement_obligations.csv` 保留全部未结数量。
+- 连续推进与保存后接续都应以同一组事件核对 `available_cash`、`frozen_cash`、`positions`、`frozen_positions` 和未结义务。
+
 ## 运行
 
 ```bash
@@ -63,19 +75,20 @@ python -m unittest discover -s tests -v
 | `market_data.csv` | 本次使用的全部人工行情 |
 | `orders.csv` | 全部委托及最终状态（含拒单、撤单、部分成交） |
 | `fills.csv` | 全部成交流水（数量、价格、金额、手续费） |
-| `ledger.csv` | 逐笔资金/持仓账目，含每笔成交后的现金、持仓余额 |
+| `settlement_events.csv` | 成交确认、交收、失败、补交冻结的逐笔过程 |
+| `settlement_obligations.csv` | 每笔成交义务的原始、已交收、失败和未结数量 |
+| `settlement_state.json` | 保存后接续所需的可用/冻结现金、证券和未结义务快照 |
+| `ledger.csv` | 兼容保留的交收事件流水 |
 | `equity_curve.csv` | 每根 bar 结算后的现金、持仓市值、总权益 |
 | `event_trace.csv` | 事件推进全轨迹（时刻、优先级、序号、明细） |
 | `open_orders.csv` | **结束时仍未完全成交的订单（含剩余数量），单独保留** |
 | `reconciliation.json` | 仅凭 `初始现金 + fills` 独立复算与引擎账目的核对结论 |
 
-现金与持仓的复算完全独立于引擎内部状态：
+交收后的现金、冻结和持仓可由成交确认与交收事件独立复算：
 
 ```python
-from backtest.account import recompute_from_fills
-rec = recompute_from_fills(result.fills, initial_cash=result.initial_cash)
-assert rec.cash == result.final_cash
-assert rec.positions == result.final_positions
+from backtest.report import reconcile
+assert reconcile(result)["passed"]
 ```
 
 ## 添加新策略

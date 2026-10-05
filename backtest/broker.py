@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from .models import Bar, Fill, Order, OrderSide, OrderStatus, OrderType
 
@@ -26,6 +26,28 @@ class CommissionModel:
         return max(self.min_commission, amount * self.rate)
 
 
+class SettlementCalendar:
+    """整数日期交收日历，holidays 中的日期不计为交收营业日。"""
+
+    def __init__(self, lag: int = 2, holidays: Optional[Set[int]] = None):
+        if lag < 0:
+            raise ValueError("交收滞后天数不能为负")
+        self.lag = lag
+        self.holidays = set(holidays or ())
+
+    def next_business_day(self, timestamp: int) -> int:
+        timestamp += 1
+        while timestamp in self.holidays:
+            timestamp += 1
+        return timestamp
+
+    def settlement_date(self, trade_timestamp: int) -> int:
+        date = trade_timestamp
+        for _ in range(self.lag):
+            date = self.next_business_day(date)
+        return date
+
+
 class Broker:
     """订单簿与撮合器。不直接修改账户，成交以 Fill 形式返回给引擎记账。"""
 
@@ -33,11 +55,19 @@ class Broker:
         self,
         commission: Optional[CommissionModel] = None,
         max_participation: float = 0.1,
+        currencies: Optional[Dict[str, str]] = None,
+        settlement_calendars: Optional[Dict[str, SettlementCalendar]] = None,
+        default_currency: str = "USD",
+        default_settlement_calendar: Optional[SettlementCalendar] = None,
     ):
         if not 0.0 < max_participation <= 1.0:
             raise ValueError("max_participation 必须在 (0, 1] 之间")
         self.commission = commission or CommissionModel()
         self.max_participation = max_participation
+        self.currencies = currencies or {}
+        self.settlement_calendars = settlement_calendars or {}
+        self.default_currency = default_currency
+        self.default_settlement_calendar = default_settlement_calendar or SettlementCalendar(lag=2)
         self._orders: Dict[int, Order] = {}
         # 当前 bar 新提交的订单：本根 bar 不撮合，下一根 bar 起生效
         self._next_bar_active: set[int] = set()
@@ -96,6 +126,12 @@ class Broker:
         """全部委托（按委托顺序），供账目落盘。"""
         return [self._orders[oid] for oid in sorted(self._orders)]
 
+    def currency_for(self, symbol: str) -> str:
+        return self.currencies.get(symbol, self.default_currency)
+
+    def calendar_for(self, symbol: str) -> SettlementCalendar:
+        return self.settlement_calendars.get(symbol, self.default_settlement_calendar)
+
     # ----- 撮合 -----
 
     def on_bar_start(self) -> None:
@@ -151,6 +187,8 @@ class Broker:
             price=fill_price,
             commission=commission,
             bar_timestamp=bar.timestamp,
+            currency=self.currency_for(order.symbol),
+            settlement_date=self.calendar_for(order.symbol).settlement_date(timestamp),
         )
 
     def params(self) -> dict:
@@ -158,4 +196,5 @@ class Broker:
             "commission_rate": self.commission.rate,
             "min_commission": self.commission.min_commission,
             "max_participation": self.max_participation,
+            "default_currency": self.default_currency,
         }

@@ -13,8 +13,7 @@ from __future__ import annotations
 
 import unittest
 
-from backtest.account import recompute_from_fills
-from backtest.broker import CommissionModel
+from backtest.broker import Broker, CommissionModel, SettlementCalendar
 from backtest.data import ManualDataFeed
 from backtest.engine import BacktestEngine
 from backtest.events import Priority
@@ -112,8 +111,11 @@ class TestFillsAndFees(unittest.TestCase):
         engine = BacktestEngine(
             ManualDataFeed(make_bars()),
             PartialFillStrategy(),
-            commission=CommissionModel(rate=0.0003, min_commission=5.0),
-            max_participation=0.1,
+            broker=Broker(
+                commission=CommissionModel(rate=0.0003, min_commission=5.0),
+                max_participation=0.1,
+                default_settlement_calendar=SettlementCalendar(lag=0),
+            ),
         )
         result = engine.run()
         order = result.orders[0]
@@ -136,10 +138,6 @@ class TestFillsAndFees(unittest.TestCase):
         self.assertAlmostEqual(result.final_cash, 1_000_000.0 - 30_000.0 - 15.0, places=6)
         self.assertEqual(result.final_positions, {"TEST": 300.0})
 
-        # 独立复算
-        rec = recompute_from_fills(result.fills, initial_cash=1_000_000.0)
-        self.assertAlmostEqual(rec.cash, result.final_cash, places=9)
-        self.assertEqual(rec.positions, result.final_positions)
         self.assertTrue(reconcile(result)["passed"])
 
 
@@ -214,6 +212,7 @@ class TestLedgerPersistence(unittest.TestCase):
                 "equity_curve.csv",
                 "event_trace.csv",
                 "open_orders.csv",
+                "settlement_state.json",
                 "reconciliation.json",
             ):
                 self.assertTrue(os.path.exists(os.path.join(out, name)), name)

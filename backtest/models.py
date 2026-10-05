@@ -109,6 +109,9 @@ class Fill:
     price: float
     commission: float
     bar_timestamp: int              # 撮合发生的 bar 时刻
+    currency: str = "USD"
+    settlement_date: Optional[int] = None
+    settlement_split_ratio: float = 1.0
 
     @property
     def gross_amount(self) -> float:
@@ -127,4 +130,7 @@ class Fill:
             "gross_amount": self.gross_amount,
             "commission": self.commission,
             "bar_timestamp": self.bar_timestamp,
+            "currency": self.currency,
+            "settlement_date": "" if self.settlement_date is None else self.settlement_date,
+            "settlement_split_ratio": self.settlement_split_ratio,
         }
